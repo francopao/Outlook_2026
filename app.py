@@ -918,6 +918,70 @@ def _read_consolidated_sheet(file_source, sheet_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# Hojas que la app espera encontrar en el Excel consolidado (nombre EXACTO,
+# sensible a mayusculas/espacios) -usado solo por _consolidated_file_diagnostics
+# para explicarle al usuario, hoja por hoja, por que algo no se pudo leer.
+_EXPECTED_SHEETS = [SHEET_PRECIOS_ZODA, SHEET_FFMM_PRECIOS, SHEET_PARAMETRIA_FFMM, SHEET_PRECIOS_CICLO_IA,
+                     SHEET_PRODUCCION_MINERIA, SHEET_SBS_BANCOS]
+
+
+def _consolidated_file_diagnostics(file_source, loaded_rows: dict) -> str:
+    """Diagnostico legible, hoja por hoja, de por que el Excel consolidado no
+    trajo los datos esperados. No se llama en el camino feliz (cuando todo
+    carga bien): solo cuando el usuario necesita entender por que algo salio
+    vacio, para no dejarlo adivinando. Compara los nombres de hoja ESPERADOS
+    (_EXPECTED_SHEETS) contra los REALES del workbook (si se puede abrir) y
+    cuantas filas trajo cada loader (`loaded_rows`: {nombre_hoja: n_filas}).
+    Tambien detecta el caso mas comun en despliegues a GitHub: un archivo
+    grande subido via Git LFS cuyo "pointer" de texto (no el binario real)
+    es lo que termina en el repo si el host no resuelve LFS -sintoma tipico:
+    'se detecto el archivo' (existe la ruta) pero ninguna hoja se puede leer."""
+    if file_source is None:
+        return "No hay ningun archivo resuelto (ni en el repo ni subido)."
+    try:
+        if hasattr(file_source, "seek"):
+            file_source.seek(0)
+            head = file_source.read(200)
+            file_source.seek(0)
+        else:
+            path = Path(file_source)
+            with open(path, "rb") as fh:
+                head = fh.read(200)
+        if isinstance(head, bytes) and head.startswith(b"version https://git-lfs"):
+            return ("El archivo detectado es un PUNTERO de Git LFS (texto plano), no el Excel real: "
+                     "probablemente se subio a GitHub via Git LFS y el host (ej. Streamlit Community "
+                     "Cloud) no lo resuelve automaticamente. Solucion: revisa que tu .gitattributes NO "
+                     "tenga una regla '*.xlsx filter=lfs' y vuelve a subir el .xlsx binario real sin LFS.")
+    except Exception:
+        pass  # si ni siquiera se pudo leer la cabecera, el intento de abrir como Excel (abajo) ya lo explica
+
+    try:
+        if hasattr(file_source, "seek"):
+            file_source.seek(0)
+        real_sheets = list(pd.ExcelFile(file_source).sheet_names)
+    except Exception as exc:  # noqa: BLE001
+        return f"El archivo se detecto pero no se pudo abrir como un workbook de Excel valido: {exc}"
+
+    lines = [f"Hojas encontradas en el archivo: {real_sheets}"]
+    for expected in _EXPECTED_SHEETS:
+        n = loaded_rows.get(expected, 0)
+        if n > 0:
+            lines.append(f"✅ '{expected}': {n} fila(s) leida(s) correctamente.")
+        elif expected in real_sheets:
+            lines.append(f"🟡 '{expected}': la hoja EXISTE con ese nombre exacto, pero no trajo filas "
+                          "(revisar que las columnas esperadas dentro de esa hoja no hayan cambiado).")
+        else:
+            close = [s for s in real_sheets if s.strip().lower() == expected.strip().lower()]
+            if close:
+                lines.append(f"🔴 '{expected}': no existe con ese nombre EXACTO, pero si existe "
+                              f"'{close[0]}' en el archivo -revisa mayusculas/minusculas o espacios de "
+                              "mas/menos, son sensibles a eso-.")
+            else:
+                lines.append(f"🔴 '{expected}': no se encontro ninguna hoja con ese nombre (ni similar) "
+                              "en el archivo.")
+    return "\n\n".join(lines)
+
+
 def _series_to_fetch_result(label: str, series: Optional[pd.Series], source: str,
                              expected_gap_days: int = 7) -> FetchResult:
     """Envuelve una pd.Series YA resuelta (leida del Excel consolidado, sin
@@ -2739,6 +2803,24 @@ def main():
             st.caption(f"{len(precios_zoda)} instrumentos locales (equity Peru + benchmarks) · "
                        f"{len(ffmm_precios)}/{len(parametria_ffmm)} fondos FFMM con precio · "
                        f"{len(ciclo_ia)} companias en el Ciclo de Valor de IA.")
+
+            # --- Diagnostico accionable: si CUALQUIERA de las hojas clave no
+            #     trajo datos, no dejar al usuario adivinando por que -esto
+            #     cubre tanto "detectado en el repo" pero con hojas rotas
+            #     (ej. Git LFS, nombre de hoja distinto) como fallas
+            #     parciales en una sola hoja. ---
+            loaded_rows = {
+                SHEET_PRECIOS_ZODA: sum(len(s) for s in precios_zoda.values()),
+                SHEET_FFMM_PRECIOS: sum(len(s) for s in ffmm_precios.values()),
+                SHEET_PARAMETRIA_FFMM: len(parametria_ffmm),
+                SHEET_PRECIOS_CICLO_IA: sum(len(v["series"]) for v in ciclo_ia.values()),
+                SHEET_PRODUCCION_MINERIA: len(produccion_mineria),
+                SHEET_SBS_BANCOS: len(sbs_bancos),
+            }
+            if any(n == 0 for n in loaded_rows.values()):
+                st.warning("Una o mas hojas del Excel consolidado no trajeron datos. Ver diagnostico abajo.")
+                with st.expander("🔎 Diagnostico detallado del Excel consolidado", expanded=True):
+                    st.code(_consolidated_file_diagnostics(consolidated_source, loaded_rows), language=None)
 
         st.markdown("---")
         if st.button("🔄 Forzar refresco de datos (limpiar cache)"):
